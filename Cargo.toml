@@ -1,0 +1,5 @@
+[workspace]
+members = [
+    "niobe",
+    "niobe-core"
+]
