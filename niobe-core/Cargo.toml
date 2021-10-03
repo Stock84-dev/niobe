@@ -10,5 +10,8 @@ license = "MIT"
 [dependencies]
 wgpu = "0.10"
 bytemuck = { version = "1.4", features = [ "derive" ] }
-nalgebra-glm = "0.15.0"
-palette = "0.6.0"
+#nalgebra-glm = { version = "0.15.0", features = ["convert-bytemuck"]}
+nalgebra-glm = { path = "../../../../data/Documents/contributions/nalgebra/nalgebra-glm", features = ["convert-bytemuck"]}
+rgb = { version = "0.8.27", features = ["bytemuck"] }
+num-traits = "0.2.14"
+derive_more = "0.99.16"

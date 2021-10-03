@@ -1,39 +1,39 @@
 use crate::buffer::{Buffer, BufferSlice};
 use bytemuck::{Pod, Zeroable};
 use nalgebra_glm::Vec2;
-use palette::rgb::Rgba;
+use private::Sealed;
+use rgb::RGBA;
 use std::convert::TryInto;
+use std::marker::PhantomData;
 use std::mem;
 use std::num::NonZeroU64;
 use wgpu::util::{DeviceExt, RenderEncoder};
 use wgpu::{
-    BindGroup, BindGroupLayout, BindingResource, BufferBinding, Device, RenderPass, RenderPipeline,
-    ShaderLocation, ShaderModule, SurfaceConfiguration,
+    BindGroup, BindGroupLayout, BindingResource, BufferAddress, BufferBinding, Device,
+    DynamicOffset, RenderPass, RenderPipeline, ShaderLocation, ShaderModule, SurfaceConfiguration,
 };
 
-pub enum HasDynamicOffset {
-    False,
-    True,
-}
-
-impl Into<bool> for HasDynamicOffset {
-    fn into(self) -> bool {
-        self as u8 != 0
-    }
-}
-
 #[repr(C)]
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, Debug)]
 pub struct LineVertex {
     pub pos: Vec2,
 }
+
 unsafe impl Pod for LineVertex {}
 unsafe impl Zeroable for LineVertex {}
 
+impl LineVertex {
+    pub fn new(x: f32, y: f32) -> Self {
+        Self {
+            pos: Vec2::new(x, y),
+        }
+    }
+}
+
 #[repr(C, align(256))]
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, Debug)]
 pub struct LineUniform {
-    pub color: Rgba,
+    pub color: RGBA<f32>,
     pub scale: Vec2,
     pub translate: Vec2,
     pub line_scale: Vec2,
@@ -42,45 +42,25 @@ pub struct LineUniform {
 unsafe impl Pod for LineUniform {}
 unsafe impl Zeroable for LineUniform {}
 
-pub struct LineStorage {
-    segment_vbo: wgpu::Buffer,
+pub struct LineShader {
     shader: ShaderModule,
-    pub uniforms: Vec<LineUniform>,
 }
 
-impl LineStorage {
+impl LineShader {
     pub fn new(device: &Device) -> Self {
-        const SEGMENT: [[f32; 2]; 6] = [
-            [0.0f32, -0.5],
-            [1., -0.5],
-            [1., 0.5],
-            [0., -0.5],
-            [1., 0.5],
-            [0., 0.5],
-        ];
-
-        let segment_vbo = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("line segment vbo"),
-            contents: bytemuck::cast_slice(&SEGMENT),
-            usage: wgpu::BufferUsages::VERTEX,
-        });
         let shader = device.create_shader_module(&wgpu::ShaderModuleDescriptor {
             label: Some("line shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("line.wgsl").into()),
         });
-        Self {
-            segment_vbo,
-            shader,
-            uniforms: vec![],
-        }
+        Self { shader }
     }
 }
 
-pub struct LineGroup {
+pub struct LineBindGroup {
     bind_group: BindGroup,
 }
 
-impl LineGroup {
+impl LineBindGroup {
     pub fn layout(device: &Device) -> BindGroupLayout {
         device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             entries: &[wgpu::BindGroupLayoutEntry {
@@ -116,134 +96,229 @@ impl LineGroup {
     }
 }
 
-pub struct LinePipeline<'s> {
+pub struct LinePipeline {
     pipeline: wgpu::RenderPipeline,
-    line_storage: &'s LineStorage,
+    segment_vbo: wgpu::Buffer,
 }
 
-impl<'s> LinePipeline<'s> {
-    const VERTEX_LOCATION: ShaderLocation = 0;
-    const INSTANCE_LOCATION: ShaderLocation = 1;
-    pub fn new(
-        device: &Device,
-        config: &SurfaceConfiguration,
-        line_storage: &'s LineStorage,
-        has_dynamic_offset: HasDynamicOffset,
-    ) -> Self {
-        let render_pipeline_layout =
-            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: Some("line render pipeline layout"),
-                bind_group_layouts: &[&LineGroup::layout(device)],
-                push_constant_ranges: &[],
-            });
-        let render_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("line render pipeline"),
-            layout: Some(&render_pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &line_storage.shader,
-                entry_point: "main",
-                buffers: &[
-                    wgpu::VertexBufferLayout {
-                        array_stride: std::mem::size_of::<Vec2>() as wgpu::BufferAddress,
-                        step_mode: wgpu::VertexStepMode::Vertex,
-                        attributes: &[wgpu::VertexAttribute {
-                            offset: 0,
-                            shader_location: 0,
-                            format: wgpu::VertexFormat::Float32x2,
-                        }],
-                    },
-                    wgpu::VertexBufferLayout {
-                        array_stride: std::mem::size_of::<LineVertex>() as wgpu::BufferAddress,
-                        step_mode: wgpu::VertexStepMode::Instance,
-                        attributes: &[wgpu::VertexAttribute {
-                            offset: 0,
-                            shader_location: 1,
-                            format: wgpu::VertexFormat::Float32x4,
-                        }],
-                    },
-                    wgpu::VertexBufferLayout {
-                        array_stride: std::mem::size_of::<LineVertex>() as wgpu::BufferAddress,
-                        step_mode: wgpu::VertexStepMode::Instance,
-                        attributes: &[wgpu::VertexAttribute {
-                            offset: std::mem::size_of::<LineVertex>() as wgpu::BufferAddress,
-                            shader_location: 2,
-                            format: wgpu::VertexFormat::Float32x4,
-                        }],
-                    },
-                ],
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &line_storage.shader,
-                entry_point: "main",
-                targets: &[wgpu::ColorTargetState {
-                    format: config.format,
-                    blend: Some(wgpu::BlendState::REPLACE),
-                    write_mask: wgpu::ColorWrites::ALL,
-                }],
-            }),
-            primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::TriangleList,
-                strip_index_format: None,
-                front_face: wgpu::FrontFace::Cw,
-                cull_mode: None,
-                polygon_mode: wgpu::PolygonMode::Fill,
-                clamp_depth: false,
-                conservative: false,
-            },
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState {
-                count: 1,
-                mask: !0,
-                alpha_to_coverage_enabled: false,
-            },
-        });
+impl LinePipeline {
+    pub fn new(device: &Device, config: &SurfaceConfiguration, line_storage: &LineShader) -> Self {
+        let pipeline = create_pipeline(&device, config, line_storage, Self::LINE_MULTIPLIER as u64);
         Self {
-            pipeline: render_pipeline,
-            line_storage,
+            pipeline: pipeline.1,
+            segment_vbo: pipeline.0,
         }
     }
 
-    pub fn group_drawer<'e, E: RenderEncoder<'e>>(
-        &'e self,
+    pub fn drawer<'s, 'e, E: RenderEncoder<'s>>(
+        &'s self,
         encoder: &'e mut E,
-    ) -> LineGroupDrawer<'e, E> {
-        encoder.set_pipeline(&self.pipeline);
-        encoder.set_vertex_buffer(0, self.line_storage.segment_vbo.slice(..));
-        LineGroupDrawer { encoder: encoder }
+    ) -> LineGroupDrawer<'s, 'e, E, Self> {
+        drawer(encoder, self, &self.pipeline, &self.segment_vbo)
     }
 }
-pub struct LineGroupDrawer<'e, E> {
+
+impl LineRenderer for LinePipeline {
+    const LINE_MULTIPLIER: u32 = 2;
+}
+
+pub struct LineStripPipeline {
+    pipeline: wgpu::RenderPipeline,
+    segment_vbo: wgpu::Buffer,
+}
+
+impl LineStripPipeline {
+    pub fn new(device: &Device, config: &SurfaceConfiguration, line_storage: &LineShader) -> Self {
+        let pipeline = create_pipeline(&device, config, line_storage, Self::LINE_MULTIPLIER as u64);
+        Self {
+            pipeline: pipeline.1,
+            segment_vbo: pipeline.0,
+        }
+    }
+
+    pub fn drawer<'s, 'e, E: RenderEncoder<'s>>(
+        &'s self,
+        encoder: &'e mut E,
+    ) -> LineGroupDrawer<'s, 'e, E, Self> {
+        drawer(encoder, self, &self.pipeline, &self.segment_vbo)
+    }
+}
+
+impl LineRenderer for LineStripPipeline {
+    const LINE_MULTIPLIER: u32 = 1;
+}
+
+#[derive(AsMut)]
+pub struct LineGroupDrawer<'s, 'e, E, P> {
+    #[as_mut]
+    encoder: &'e mut E,
+    pipeline: &'s P,
+}
+
+impl<'s, 'e, E: RenderEncoder<'s>, P: LineRenderer> LineGroupDrawer<'s, 'e, E, P> {
+    pub fn bind_group(
+        self,
+        bind_group: &'s LineBindGroup,
+        uniform_id: u32,
+    ) -> LineDrawer<'s, 'e, E, P> {
+        self.encoder.set_bind_group(
+            0,
+            &bind_group.bind_group,
+            &[uniform_id * std::mem::size_of::<LineUniform>() as DynamicOffset],
+        );
+        LineDrawer {
+            pipeline: self.pipeline,
+            encoder: self.encoder,
+        }
+    }
+
+    pub fn finish(self) -> &'s P {
+        self.pipeline
+    }
+}
+
+#[derive(AsMut)]
+pub struct LineDrawer<'s, 'e, E, P> {
+    #[as_mut]
+    pipeline: &'s P,
     encoder: &'e mut E,
 }
 
-impl<'e, E: RenderEncoder<'e>> LineGroupDrawer<'e, E> {
-    pub fn drawer(
-        &'e mut self,
-        group: &'e LineGroup,
-        line_ubo: &BufferSlice<'e, LineUniform>,
-    ) -> LineDrawer<'e, E> {
-        self.encoder.set_bind_group(
-            0,
-            &group.bind_group,
-            &[line_ubo.raw_addres_range().start.try_into().unwrap()],
-        );
-        self.encoder.set_vertex_buffer(0, line_ubo.to_raw_slice());
-        LineDrawer { group: self }
+impl<'s, 'e, E: RenderEncoder<'s>, P: LineRenderer> LineDrawer<'s, 'e, E, P> {
+    pub fn draw(self, vertices: BufferSlice<'s, LineVertex>) -> Self {
+        self.encoder.set_vertex_buffer(1, vertices.to_raw_slice());
+        self.encoder.set_vertex_buffer(2, vertices.to_raw_slice());
+        let range = vertices.range();
+        let mut count = range.end - range.start;
+        if P::LINE_MULTIPLIER == 1 {
+            count -= 1;
+        } else {
+            count /= P::LINE_MULTIPLIER;
+        }
+        // Since instance wertex buffers are sliced we start from 0
+        self.encoder.draw(0..6 as _, 0..count);
+        self
+    }
+
+    pub fn finish(self) -> LineGroupDrawer<'s, 'e, E, P> {
+        LineGroupDrawer {
+            encoder: self.encoder,
+            pipeline: self.pipeline,
+        }
     }
 }
 
-pub struct LineDrawer<'e, E> {
-    group: &'e mut LineGroupDrawer<'e, E>,
+const SEGMENT: [[f32; 2]; 6] = [
+    [0.0f32, -0.5],
+    [1., -0.5],
+    [1., 0.5],
+    [0., -0.5],
+    [1., 0.5],
+    [0., 0.5],
+];
+
+fn create_pipeline(
+    device: &Device,
+    config: &SurfaceConfiguration,
+    line_storage: &LineShader,
+    stride_multiplier: BufferAddress,
+) -> (wgpu::Buffer, RenderPipeline) {
+    let segment_vbo = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("line segment vbo"),
+        contents: bytemuck::cast_slice(&SEGMENT),
+        usage: wgpu::BufferUsages::VERTEX,
+    });
+    let render_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("line render pipeline layout"),
+        bind_group_layouts: &[&LineBindGroup::layout(device)],
+        push_constant_ranges: &[],
+    });
+    let render_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("line render pipeline"),
+        layout: Some(&render_pipeline_layout),
+        vertex: wgpu::VertexState {
+            module: &line_storage.shader,
+            entry_point: "main",
+            buffers: &[
+                wgpu::VertexBufferLayout {
+                    array_stride: std::mem::size_of::<Vec2>() as wgpu::BufferAddress,
+                    step_mode: wgpu::VertexStepMode::Vertex,
+                    attributes: &[wgpu::VertexAttribute {
+                        offset: 0,
+                        shader_location: 0,
+                        format: wgpu::VertexFormat::Float32x2,
+                    }],
+                },
+                wgpu::VertexBufferLayout {
+                    array_stride: mem::size_of::<LineVertex>() as wgpu::BufferAddress
+                        * stride_multiplier,
+                    step_mode: wgpu::VertexStepMode::Instance,
+                    attributes: &[wgpu::VertexAttribute {
+                        offset: 0,
+                        shader_location: 1,
+                        format: wgpu::VertexFormat::Float32x2,
+                    }],
+                },
+                wgpu::VertexBufferLayout {
+                    array_stride: mem::size_of::<LineVertex>() as wgpu::BufferAddress
+                        * stride_multiplier,
+                    step_mode: wgpu::VertexStepMode::Instance,
+                    attributes: &[wgpu::VertexAttribute {
+                        offset: std::mem::size_of::<LineVertex>() as wgpu::BufferAddress,
+                        shader_location: 2,
+                        format: wgpu::VertexFormat::Float32x2,
+                    }],
+                },
+            ],
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: &line_storage.shader,
+            entry_point: "main",
+            targets: &[wgpu::ColorTargetState {
+                format: config.format,
+                blend: Some(wgpu::BlendState::REPLACE),
+                write_mask: wgpu::ColorWrites::ALL,
+            }],
+        }),
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            strip_index_format: None,
+            front_face: wgpu::FrontFace::Ccw,
+            cull_mode: None,
+            polygon_mode: wgpu::PolygonMode::Fill,
+            clamp_depth: false,
+            conservative: false,
+        },
+        depth_stencil: None,
+        multisample: wgpu::MultisampleState {
+            count: 1,
+            mask: !0,
+            alpha_to_coverage_enabled: false,
+        },
+    });
+    (segment_vbo, render_pipeline)
 }
 
-impl<'e, E: RenderEncoder<'e>> LineDrawer<'e, E> {
-    pub fn draw(&mut self, vertices: &BufferSlice<'e, LineVertex>) {
-        self.group
-            .encoder
-            .set_vertex_buffer(1, vertices.to_raw_slice());
-        self.group
-            .encoder
-            .set_vertex_buffer(2, vertices.to_raw_slice());
-        self.group.encoder.draw(0..6 as _, vertices.range());
+fn drawer<'s, 'e, E: RenderEncoder<'s>, P>(
+    encoder: &'e mut E,
+    pipeline: &'s P,
+    inner_pipeline: &'s RenderPipeline,
+    segment_vbo: &'s wgpu::Buffer,
+) -> LineGroupDrawer<'s, 'e, E, P> {
+    encoder.set_pipeline(inner_pipeline);
+    encoder.set_vertex_buffer(0, segment_vbo.slice(..));
+    LineGroupDrawer {
+        encoder,
+        pipeline: pipeline,
     }
+}
+
+pub trait LineRenderer: Sealed {
+    const LINE_MULTIPLIER: u32;
+}
+
+mod private {
+    pub trait Sealed {}
+    impl Sealed for super::LinePipeline {}
+    impl Sealed for super::LineStripPipeline {}
 }

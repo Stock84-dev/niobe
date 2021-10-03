@@ -1,18 +1,22 @@
 use bytemuck::Pod;
+use num_traits::{CheckedAdd, One, Zero};
+use std::collections::Bound;
 use std::mem;
-use std::ops::Range;
+use std::ops::{Index, Range, RangeBounds};
 use wgpu::util::{BufferInitDescriptor, DeviceExt};
-use wgpu::{BufferAddress, BufferUsages, Device};
+use wgpu::{BufferAddress, BufferUsages, Device, Queue};
 
+#[derive(Debug)]
 pub struct Buffer<T: Copy + Pod> {
-    pub(super) buf: wgpu::Buffer,
-    len: usize,
+    pub buf: wgpu::Buffer,
+    len: u32,
     phantom_data: std::marker::PhantomData<T>,
 }
 
 impl<T: Copy + Pod> Buffer<T> {
     pub fn new(device: &Device, usage: BufferUsages, data: &[T]) -> Self {
         let contents = bytemuck::cast_slice(data);
+        debug_assert!(data.len() <= u32::MAX as usize);
 
         Self {
             buf: device.create_buffer_init(&BufferInitDescriptor {
@@ -20,21 +24,48 @@ impl<T: Copy + Pod> Buffer<T> {
                 contents,
                 usage,
             }),
-            len: data.len(),
+            len: data.len() as u32,
             phantom_data: std::marker::PhantomData,
         }
     }
 
-    pub fn slice(&self, range: Range<u32>) -> BufferSlice<'_, T> {
+    pub fn slice(&self, range: impl RangeBounds<u32>) -> BufferSlice<'_, T> {
+        let start = match range.start_bound() {
+            Bound::Included(b) => *b,
+            Bound::Excluded(_) => unreachable!("range start bound cannot be excluded"),
+            Bound::Unbounded => 0,
+        };
+        let end = match range.end_bound() {
+            Bound::Included(b) => *b + 1,
+            Bound::Excluded(b) => *b,
+            Bound::Unbounded => self.len,
+        };
         BufferSlice {
             buf: &self.buf,
-            range,
+            range: start..end,
             phantom_data: Default::default(),
         }
     }
 
-    pub fn len(&self) -> usize {
+    pub fn len(&self) -> u32 {
         self.len
+    }
+
+    pub fn write(&self, queue: &Queue, offset: usize, data: &[T]) {
+        queue.write_buffer(
+            &self.buf,
+            (offset * mem::size_of::<T>()) as BufferAddress,
+            bytemuck::cast_slice(data),
+        )
+    }
+
+    pub fn write_sliced(&self, queue: &Queue, range: impl RangeBounds<usize>, data: &[T]) {
+        let range = range_from_range_bounds(range, data.len());
+        queue.write_buffer(
+            &self.buf,
+            (range.start * mem::size_of::<T>()) as BufferAddress,
+            bytemuck::cast_slice(&data[range]),
+        )
     }
 }
 
@@ -72,6 +103,7 @@ impl<T: Copy + Pod> Buffer<T> {
 //    fn deref(&self) -> &Self::Target { &self.0 }
 //}
 
+#[derive(Clone)]
 pub struct BufferSlice<'a, T: Copy + Pod> {
     buf: &'a wgpu::Buffer,
     range: Range<u32>,
@@ -95,4 +127,21 @@ impl<'a, T: Copy + Pod> BufferSlice<'a, T> {
     pub fn to_raw_slice(&self) -> wgpu::BufferSlice<'a> {
         self.buf.slice(self.raw_addres_range())
     }
+}
+
+fn range_from_range_bounds<T: One + CheckedAdd + Zero + Copy>(
+    bounds: impl RangeBounds<T>,
+    max_bound: T,
+) -> Range<T> {
+    let start = match bounds.start_bound() {
+        Bound::Included(b) => *b,
+        Bound::Excluded(_) => unreachable!("range start bound cannot be excluded"),
+        Bound::Unbounded => T::zero(),
+    };
+    let end = match bounds.end_bound() {
+        Bound::Included(b) => b.checked_add(&T::one()).unwrap(),
+        Bound::Excluded(b) => *b,
+        Bound::Unbounded => max_bound,
+    };
+    start..end
 }
