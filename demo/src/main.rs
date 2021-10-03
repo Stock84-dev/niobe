@@ -1,25 +1,85 @@
 // good tutuorials for graphs: https://en.wikibooks.org/wiki/OpenGL_Programming
+//use crate::compute::Compute;
+use crate::instance_shader::InstanceShader;
 use anyhow::Result;
-use wgpu::{
-    BindingResource, BufferSize, BufferUsages, DynamicOffset, Maintain, MapMode, TextureFormat,
+use cgmath::{ortho, vec2, InnerSpace, Matrix4, Ortho, Rotation3, Vector2, Zero};
+use futures::executor::{LocalPool, LocalSpawner};
+use futures::task::SpawnExt;
+use glyph_brush::ab_glyph::PxScale;
+use glyph_brush::{HorizontalAlign, Layout, OwnedSection, OwnedText, VerticalAlign};
+use lexical::write_float_options::RoundMode;
+use log::*;
+use lyon::algorithms::math::{point, Point};
+use lyon::lyon_tessellation::{
+    BuffersBuilder, FillOptions, FillVertexConstructor, LineJoin, StrokeVertexConstructor,
 };
+use lyon::tessellation;
+use lyon::tessellation::geometry_builder::simple_builder;
+use lyon::tessellation::path::Path;
+use lyon::tessellation::{
+    FillTessellator, LineCap, StrokeOptions, StrokeTessellator, VertexBuffers,
+};
+use nalgebra_glm::Vec2;
+use niobe_core::buffer::Buffer;
+use niobe_core::colors;
+use niobe_core::pipelines::line::{
+    LineBindGroup, LinePipeline, LineShader, LineStripPipeline, LineUniform, LineVertex,
+};
+use palette::rgb::Rgba;
+use pipe_trait::*;
+use rgb::RGBA;
+use std::convert::TryInto;
+use std::num::{NonZeroU64, NonZeroUsize};
+use std::ops::Rem;
+use std::time::Instant;
+use std::{iter, mem};
+use wgpu::util::{DeviceExt, StagingBelt};
+use wgpu::BufferBinding;
+use wgpu::{
+    BindingResource, BufferSize, BufferUsages, Color, DynamicOffset, Maintain, MapMode,
+    TextureFormat,
+};
+use wgpu_glyph::ab_glyph::FontArc;
+use wgpu_glyph::{ab_glyph, GlyphBrush, GlyphBrushBuilder, Section, Text};
+use winit::dpi::PhysicalPosition;
+use winit::window::Window;
 use winit::{
     event::*,
     event_loop::{ControlFlow, EventLoop},
     window::WindowBuilder,
 };
-const RED: [f32; 4] = [1.0, 0., 0., 1.];
-const BLACK: [f32; 4] = [0.0, 0., 0., 1.];
 
 mod compute;
 mod line_shader;
-mod niobe_state;
 //mod lion;
 mod bug;
 mod bug2;
 mod bug3;
 mod instance_shader;
 mod texture;
+
+const BORDER_ID: usize = 0;
+const GRID_ID: usize = 1;
+const CROSSHAIR_ID: usize = 2;
+const LINES_ID: usize = 3;
+const BORDER_COLOR: RGBA<f32> = RGBA {
+    r: 0.1,
+    g: 0.1,
+    b: 0.1,
+    a: 1.,
+};
+const GRID_COLOR: RGBA<f32> = RGBA {
+    r: 0.1,
+    g: 0.1,
+    b: 0.1,
+    a: 1.,
+};
+const BACKGROUND_COLOR: RGBA<f32> = RGBA {
+    r: 0.01,
+    g: 0.01,
+    b: 0.01,
+    a: 1.,
+};
 
 #[repr(C)]
 #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
@@ -108,8 +168,8 @@ impl Vertex {
 
 fn main() -> Result<()> {
     env_logger::init();
-    bug2::main()?;
-    return Ok(());
+    //    bug2::main()?;
+    //    return Ok(());
 
     let event_loop = EventLoop::new();
     let window = WindowBuilder::new().build(&event_loop).unwrap();
@@ -117,10 +177,10 @@ fn main() -> Result<()> {
     //    let mut compute = pollster::block_on(compute::Compute::new(&window))?;
     //    pollster::block_on(compute.compute())?;
     //    return Ok(());
-    let mut state = pollster::block_on(State::new(&window));
+    let mut state = pollster::block_on(State::new(&window))?;
     let mut left_hold = false;
-    let mut mouse_start_pos = Vector2::new(0., 0.);
-    let mut mouse_pos = Vector2::new(0., 0.);
+    let mut mouse_start_pos = Vec2::new(0., 0.);
+    let mut mouse_pos = Vec2::new(0., 0.);
 
     event_loop.run(move |event, _, control_flow| {
         match event {
@@ -156,7 +216,7 @@ fn main() -> Result<()> {
                             position,
                             modifiers,
                         } => {
-                            let pos = Vector2::new(position.x as f32, position.y as f32);
+                            let pos = Vec2::new(position.x as f32, position.y as f32);
                             let delta = pos - mouse_pos;
                             mouse_pos = pos;
                             if left_hold {
@@ -208,28 +268,6 @@ fn main() -> Result<()> {
     });
 }
 
-//use crate::compute::Compute;
-use crate::instance_shader::InstanceShader;
-use cgmath::{ortho, vec2, InnerSpace, Matrix4, Ortho, Rotation3, Vector2, Zero};
-use lyon::algorithms::math::{point, Point};
-use lyon::lyon_tessellation::{
-    BuffersBuilder, FillOptions, FillVertexConstructor, LineJoin, StrokeVertexConstructor,
-};
-use lyon::tessellation;
-use lyon::tessellation::geometry_builder::simple_builder;
-use lyon::tessellation::path::Path;
-use lyon::tessellation::{
-    FillTessellator, LineCap, StrokeOptions, StrokeTessellator, VertexBuffers,
-};
-use std::convert::TryInto;
-use std::num::NonZeroU64;
-use std::time::Instant;
-use std::{iter, mem};
-use wgpu::util::DeviceExt;
-use wgpu::BufferBinding;
-use winit::dpi::PhysicalPosition;
-use winit::window::Window;
-
 #[rustfmt::skip]
 pub const OPENGL_TO_WGPU_MATRIX: cgmath::Matrix4<f32> = cgmath::Matrix4::new(
     1.0, 0.0, 0.0, 0.0,
@@ -256,23 +294,125 @@ struct State {
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
     size: winit::dpi::PhysicalSize<u32>,
-    render_pipeline: wgpu::RenderPipeline,
-    quad_vbo: wgpu::Buffer,
-    border_ibo: wgpu::Buffer,
-    instance_vbo: wgpu::Buffer,
-    //    index_buffer: wgpu::Buffer,
-    instances: Vec<[f32; 2]>,
-    borders: Vec<Vector2<f32>>,
-    //    vertices: Vec<Vertex>,
-    //    indicies: Vec<u16>,
-    uniforms: Vec<Uniform>,
-    ubo: wgpu::Buffer,
+    line_group: LineBindGroup,
+    line_pipeline: LinePipeline,
+    line_strip_pipeline: LineStripPipeline,
+    line_vbo: Buffer<LineVertex>,
+    ui_lines: Vec<LineVertex>,
+    uniforms: Vec<LineUniform>,
+    ui_vbo: Buffer<LineVertex>,
+    line_ubo: Buffer<LineUniform>,
     instance_shader: InstanceShader,
-    uniform_bind_group: wgpu::BindGroup,
+    points: Vec<LineVertex>,
     margin: u32,
+    n_x_ticks: usize,
+    n_y_ticks: usize,
+    x_sections: Vec<OwnedSection>,
+    y_sections: Vec<OwnedSection>,
+    glyph_brush: GlyphBrush<()>,
+    staging_belt: StagingBelt,
+    pool: LocalPool,
+    spawner: LocalSpawner,
+    border_width: u32,
+    grid_line_width: u32,
 }
 
 impl State {
+    fn update_ticks(&mut self) {
+        let pixel_scale = Vec2::new(
+            1. / self.size.width as f32 * 2.,
+            1. / self.size.height as f32 * 2.,
+        );
+        const FORMAT: u128 = lexical::format::STANDARD;
+        let options = lexical::WriteFloatOptions::builder()
+            // Only write up to 5 significant digits, IE, `1.23456` becomes `1.2345`.
+            .max_significant_digits(NonZeroUsize::new(2))
+            .round_mode(RoundMode::Round)
+            // Trim the trailing `.0` from integral float strings.
+            .trim_floats(true)
+            .decimal_point(b'.')
+            .build()
+            .unwrap();
+
+        let uni = &self.uniforms[LINES_ID];
+        let mut log = 10.0f32.powf(-uni.scale.x.log10().floor()) / 100.;
+        let start = (-1. - uni.translate.x + self.margin as f32 * pixel_scale.x) / uni.scale.x;
+        let mut x_value = if start > 0. {
+            start - start.rem(log) + log
+        } else {
+            start - start.rem(log)
+        };
+        let mut x = x_value * uni.scale.x + uni.translate.x;
+        let mut tick_spacing = log * uni.scale.x;
+        if 2. / tick_spacing > 50. {
+            log *= 10.;
+            tick_spacing *= 10.;
+            x_value = start - start.rem(log);
+            x = x_value * uni.scale.x + uni.translate.x;
+        }
+
+        let n_x_ticks = 2. / tick_spacing;
+        for i in 0..self.n_x_ticks {
+            self.x_sections[i].bounds =
+                (self.size.width as f32 / n_x_ticks, self.size.height as f32);
+            self.x_sections[i].screen_position = ((x + 1.) / pixel_scale.x, 1.95 / pixel_scale.y);
+            self.x_sections[i].text[0].text =
+                lexical::to_string_with_options::<_, FORMAT>(x_value, &options);
+            self.ui_lines[5 + i * 2] = LineVertex::new(x, -1.);
+            self.ui_lines[5 + i * 2 + 1] = LineVertex::new(x, 1.);
+            x += tick_spacing;
+            if x > 1. - self.margin as f32 * pixel_scale.x {
+                for (j, section) in self.x_sections.iter_mut().enumerate().skip(i + 1) {
+                    section.text[0].text = "".into();
+                    self.ui_lines[5 + j * 2] = LineVertex::new(0., 0.);
+                    self.ui_lines[5 + j * 2 + 1] = LineVertex::new(0., 0.);
+                }
+                break;
+            }
+            x_value += log;
+        }
+
+        let mut log = 10.0f32.powf(-uni.scale.y.log10().floor()) / 100.;
+        let start = (-1. - uni.translate.y + self.margin as f32 * pixel_scale.y) / uni.scale.y;
+        let mut y_value = if start > 0. {
+            start - start.rem(log) + log
+        } else {
+            start - start.rem(log)
+        };
+        let mut y = y_value * uni.scale.y + uni.translate.y;
+        let mut tick_spacing = log * uni.scale.y;
+        if 2. / tick_spacing > 50. {
+            log *= 10.;
+            tick_spacing *= 10.;
+            y_value = start - start.rem(log);
+            y = y_value * uni.scale.y + uni.translate.y;
+        }
+
+        let n_y_ticks = 2. / tick_spacing;
+        for i in 0..self.n_y_ticks {
+            self.y_sections[i].bounds =
+                (self.size.width as f32 / n_y_ticks, self.size.height as f32);
+            self.y_sections[i].screen_position =
+                (0., self.size.height as f32 - (y + 1.) / pixel_scale.y);
+            self.y_sections[i].text[0].text =
+                lexical::to_string_with_options::<_, FORMAT>(y_value, &options);
+            self.ui_lines[5 + self.n_x_ticks * 2 + i * 2] = LineVertex::new(-1., y);
+            self.ui_lines[5 + self.n_x_ticks * 2 + i * 2 + 1] = LineVertex::new(1., y);
+            y += tick_spacing;
+            if y > 1. - self.margin as f32 * pixel_scale.y {
+                for (j, section) in self.y_sections.iter_mut().enumerate().skip(i + 1) {
+                    section.text[0].text = "".into();
+                    self.ui_lines[5 + self.n_x_ticks * 2 + j * 2] = LineVertex::new(0., 0.);
+                    self.ui_lines[5 + self.n_x_ticks * 2 + j * 2 + 1] = LineVertex::new(0., 0.);
+                }
+                break;
+            }
+            y_value += log;
+        }
+
+        self.ui_vbo.write_sliced(&self.queue, 5.., &self.ui_lines);
+    }
+
     fn zoom(&mut self, mut delta: f32) {
         println!("input zoom {:?}", delta);
         let base = 0.05;
@@ -282,13 +422,16 @@ impl State {
             delta = 1. - delta.abs() * base;
         }
         println!("zoom {:?}", delta);
-        self.uniforms
-            .iter_mut()
-            .skip(1)
-            .for_each(|x| x.scale *= delta);
+        self.uniforms.iter_mut().skip(LINES_ID).for_each(|x| {
+            x.line_scale *= 2. - delta;
+            x.scale *= delta
+        });
+        self.update_ticks();
+        self.line_ubo
+            .write_sliced(&self.queue, LINES_ID.., &self.uniforms);
     }
 
-    fn pan(&mut self, mut physical_delta: Vector2<f32>) {
+    fn pan(&mut self, mut physical_delta: Vec2) {
         println!("pan {:?}", physical_delta);
         println!("size {:?}", self.size);
         physical_delta.x /= self.size.width as f32;
@@ -297,18 +440,25 @@ impl State {
 
         self.uniforms
             .iter_mut()
-            .skip(1)
+            .skip(LINES_ID)
             .for_each(|x| x.translate += delta * 2.);
+        self.update_ticks();
+        self.line_ubo
+            .write_sliced(&self.queue, LINES_ID.., &self.uniforms);
     }
 
     fn resize(&mut self, new_size: winit::dpi::PhysicalSize<u32>) {
-        if new_size.width > 0 && new_size.height > 0 {
+        if new_size.width > self.margin * 2 && new_size.height > self.margin * 2 {
             self.size = new_size;
+            let pixel_scale = Vec2::new(
+                1. / self.size.width as f32 * 2.,
+                1. / self.size.height as f32 * 2.,
+            );
             self.config.width = new_size.width;
             self.config.height = new_size.height;
             self.surface.configure(&self.device, &self.config);
-            self.uniforms[0].scale = vec2(0.9, 0.9);
-            let scale = Vector2::new(
+            self.uniforms[BORDER_ID].scale = Vec2::new(0.9, 0.9);
+            let scale = Vec2::new(
                 (self.size.width - self.margin * 2) as f32 / self.size.width as f32,
                 (self.size.height - self.margin * 2) as f32 / self.size.height as f32,
             );
@@ -323,21 +473,59 @@ impl State {
             //                    self.borders.len() * std::mem::size_of::<Vector2<f32>>(),
             //                )
             //            });
-            self.uniforms[0].scale = scale;
+            self.uniforms[BORDER_ID].scale = scale;
             //            self.uniforms[0].line_width = 0.01;
-            let pixel_width = 10;
             //            self.uniforms[0].line_width = (pixel_width as f32 / self.size.width as f32);
             // we are scaling line width in shader so we are nautralizing here
-            self.uniforms[0].line_scale.x =
-                ((pixel_width as f32) / self.size.width as f32) / scale.x;
-            self.uniforms[0].line_scale.y =
-                ((pixel_width as f32) / self.size.height as f32) / scale.y;
-            //                        self.uniforms[0].line_width = (pixel_width as f32 / self.size.width as f32)
-            //                            .max(pixel_width as f32 / self.size.height as f32);
+            self.uniforms[BORDER_ID].line_scale.x = self.border_width as f32 * pixel_scale.x;
+            self.uniforms[BORDER_ID].line_scale.y = self.border_width as f32 * pixel_scale.y;
+            self.uniforms[GRID_ID].line_scale.x = self.grid_line_width as f32 * pixel_scale.x;
+            self.uniforms[GRID_ID].line_scale.y = self.grid_line_width as f32 * pixel_scale.y;
+            self.line_ubo
+                .write(&self.queue, 0, &self.uniforms[..GRID_ID + 1]);
             println!(
                 "scale {:?} width {:?}",
-                self.uniforms[0].scale, self.uniforms[0].line_scale
+                self.uniforms[BORDER_ID].scale, self.uniforms[BORDER_ID].line_scale
             );
+            let x_step = (self.size.width - self.margin * 2) as f32 * pixel_scale.x
+                / (self.n_x_ticks - 1) as f32;
+            let mut x_tick_x_pos = -1. + self.margin as f32 * pixel_scale.x;
+            let x_tick_y_pos = -1. + self.margin as f32 * pixel_scale.y;
+            let x_tick_y_size = 10. * pixel_scale.y;
+            for i in 0..self.n_x_ticks {
+                // TODO: draw indexed
+                // we are duplicating some vertices here, but it is better to keep the same shader
+                // for few hundred vertices
+                self.ui_lines[5 + i * 2] = LineVertex::new(x_tick_x_pos, x_tick_y_pos);
+
+                let mut end_pos = x_tick_y_pos - x_tick_y_size;
+                if i % 2 == 0 {
+                    end_pos -= x_tick_y_size;
+                }
+
+                self.ui_lines[5 + i * 2 + 1] = LineVertex::new(x_tick_x_pos, end_pos);
+                x_tick_x_pos += x_step;
+            }
+
+            let y_step = (self.size.height - self.margin * 2) as f32 * pixel_scale.y
+                / (self.n_y_ticks - 1) as f32;
+            let mut y_tick_y_pos = -1. + self.margin as f32 * pixel_scale.y;
+            let y_tick_x_pos = -1. + self.margin as f32 * pixel_scale.x;
+            let y_tick_x_size = 10. * pixel_scale.x;
+            for i in 0..self.n_y_ticks {
+                let mut end_pos = y_tick_x_pos - y_tick_x_size;
+                if i % 2 == 0 {
+                    end_pos -= y_tick_x_size;
+                }
+                self.ui_lines[self.n_x_ticks * 2 + 5 + i * 2] =
+                    LineVertex::new(end_pos, y_tick_y_pos);
+                // we are duplicating some vertices here, but it is better to keep the same shader
+                // for few hundred vertices
+                self.ui_lines[self.n_x_ticks * 2 + 5 + i * 2 + 1] =
+                    LineVertex::new(y_tick_x_pos, y_tick_y_pos);
+                y_tick_y_pos += y_step;
+            }
+            self.ui_vbo.write_sliced(&self.queue, 5.., &self.ui_lines);
         }
     }
 
@@ -364,67 +552,84 @@ impl State {
                 resolve_target: None,
                 ops: wgpu::Operations {
                     load: wgpu::LoadOp::Clear(wgpu::Color {
-                        r: 0.1,
-                        g: 0.2,
-                        b: 0.3,
-                        a: 1.0,
+                        r: BACKGROUND_COLOR.r as f64,
+                        g: BACKGROUND_COLOR.g as f64,
+                        b: BACKGROUND_COLOR.b as f64,
+                        a: BACKGROUND_COLOR.a as f64,
                     }),
                     store: true,
                 },
             }],
             depth_stencil_attachment: None,
         });
-        unsafe {
-            self.queue.write_buffer(
-                &self.ubo,
-                0 as _,
-                std::slice::from_raw_parts(
-                    self.uniforms.as_ptr() as *const u8,
-                    self.uniforms.len() * 256,
-                ),
-            );
+        let tick_size = 5;
+        let x_offset = self.margin - tick_size;
+        let y_offset = self.margin - tick_size;
+        let drawer = self
+            .line_strip_pipeline
+            .drawer(&mut render_pass)
+            .bind_group(&self.line_group, 0)
+            .draw(self.ui_vbo.slice(..5))
+            .finish()
+            .pipe(|mut x| {
+                x.as_mut().set_scissor_rect(
+                    self.margin + self.border_width / 2,
+                    self.margin + self.border_width / 2,
+                    self.size.width - self.margin * 2 - self.border_width,
+                    self.size.height - self.margin * 2 - self.border_width,
+                );
+                x
+            })
+            .bind_group(&self.line_group, 2)
+            .draw(self.line_vbo.slice(..));
+
+        //        render_pass.set_scissor_rect(
+        //            x_offset,
+        //            y_offset,
+        //            self.size.width - x_offset * 2,
+        //            self.size.height - y_offset * 2,
+        //        );
+        self.line_pipeline
+            .drawer(&mut render_pass)
+            .bind_group(&self.line_group, 1)
+            .draw(self.ui_vbo.slice(5..));
+        for section in &self.x_sections {
+            self.glyph_brush.queue(section);
         }
-        
-        render_pass.set_pipeline(&self.render_pipeline);
-        render_pass.set_vertex_buffer(0, self.quad_vbo.slice(..));
-
-        // draw border
-        render_pass.set_bind_group(0, &self.uniform_bind_group, &[0]);
-        render_pass.set_vertex_buffer(1, self.border_ibo.slice(..));
-        render_pass.set_vertex_buffer(2, self.border_ibo.slice(..));
-        render_pass.draw(0..6 as _, 0..(4) as _);
-
-        //         draw plot
-        render_pass.set_bind_group(
-            0,
-            &self.uniform_bind_group,
-            &[std::mem::size_of::<Uniform>() as _],
-        );
-        render_pass.set_vertex_buffer(1, self.instance_vbo.slice(..));
-        render_pass.set_vertex_buffer(2, self.instance_vbo.slice(..));
-        render_pass.draw(0..6 as _, 0..(self.instances.len() - 1) as _);
-        //        render_pass.draw(0..3 as _, 0..(1) as _);
-        //        render_pass.draw(0..self.vertices.len() as _, 0..1);
-        //        render_pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
-        //        render_pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
-        //        render_pass.draw_indexed(0..self.indicies1.len() as _, 0, 0..1);
-        //        render_pass.set_index_buffer(self.index_buffer2.slice(..), wgpu::IndexFormat::Uint32);
-        //        render_pass.draw_indexed(0..6 as _, 0, 0..1);
-        //        render_pass.draw_indexed(0..6 as _, 0, 0..1);
-        //        render_pass.draw(0..4 as _, 0..(2) as _);
+        for section in &self.y_sections {
+            self.glyph_brush.queue(section);
+        }
 
         drop(render_pass);
+        self.glyph_brush
+            .draw_queued(
+                &self.device,
+                &mut self.staging_belt,
+                &mut encoder,
+                &view,
+                self.size.width,
+                self.size.height,
+            )
+            .expect("Draw queued");
+        self.staging_belt.finish();
+
         let e = encoder.finish();
         let i = std::iter::once(e);
         // submit will accept anything that implements IntoIter
         self.queue.submit(i);
+        self.spawner
+            .spawn(self.staging_belt.recall())
+            .expect("Recall staging belt");
+
+        self.pool.run_until_stalled();
         Ok(())
     }
 
     // Creating some of the wgpu types requires async code
-    async fn new(window: &Window) -> Self {
+    async fn new(window: &Window) -> Result<Self> {
         let size = window.inner_size();
         let margin = 50;
+        let pixel_scale = Vec2::new(1. / size.width as f32 * 2., 1. / size.height as f32 * 2.);
         //        let adapter = instance
         //        .enumerate_adapters(wgpu::Backends::all())
         //        .filter(|adapter| {
@@ -436,7 +641,7 @@ impl State {
 
         // The instance is a handle to our GPU
         // BackendBit::PRIMARY => Vulkan + Metal + DX12 + Browser WebGPU
-        let instance = wgpu::Instance::new(wgpu::Backends::all());
+        let instance = wgpu::Instance::new(wgpu::Backends::GL);
         let surface = unsafe { instance.create_surface(window) };
         println!("surface");
         let adapter = instance
@@ -470,30 +675,34 @@ impl State {
         let start = 50.0f32;
         let end = 100.;
         let range = (end - start).abs();
-        let n_ticks = 11;
+        let n_ticks = 21;
         let tick_vertices: Vec<_> = (0..n_ticks)
             .into_iter()
             .map(|x| (x as f32 / n_ticks as f32) * range + start)
             .collect();
-        let scale = Vector2::new(
+        let scale = Vec2::new(
             (size.width - margin * 2) as f32 / size.width as f32,
             (size.height - margin * 2) as f32 / size.height as f32,
         );
 
-        let mut uniforms = vec![
-            Uniform {
-                color: [0.0, 0., 0., 1.],
-                scale: vec2(1., 1.),
-                translate: Vector2::new(0.0, 0.0),
-                line_scale: Vector2::new(0.01, 0.01),
-                ortho: ortho(0., size.width as f32, size.height as f32, 0., 0., 1.),
-            },
-            Uniform {
-                color: [1.0, 0., 0., 1.],
+        let uniforms = vec![
+            LineUniform {
+                color: BORDER_COLOR,
                 scale,
-                translate: Vector2::new(0.0, 0.0),
-                line_scale: Vector2::new(0.01, 0.01),
-                ortho: ortho(0., size.width as f32, size.height as f32, 0., 0., 1.),
+                translate: Vec2::new(0.0, 0.0),
+                line_scale: Vec2::new(0.01, 0.01),
+            },
+            LineUniform {
+                color: GRID_COLOR,
+                scale: Vec2::new(1., 1.),
+                translate: Vec2::new(0.0, 0.0),
+                line_scale: Vec2::new(0.002, 0.002),
+            },
+            LineUniform {
+                color: colors::ORANGE,
+                scale: Vec2::new(1., 1.),
+                translate: Vec2::new(0.0, 0.0),
+                line_scale: Vec2::new(0.002, 0.002),
             },
         ];
         #[rustfmt::skip]
@@ -505,72 +714,60 @@ impl State {
              [1.,  0.5],
              [0.,  0.5]
         ];
-        let mut borders = vec![
-            vec2(-1.0f32, -1.0),
-            vec2(1.0, -1.0),
-            vec2(1.0, 1.0),
-            vec2(-1.0, 1.0),
-            vec2(-1.0, -1.0),
+        let mut ui_lines = vec![
+            LineVertex::new(-1.0f32, -1.0),
+            LineVertex::new(1.0, -1.0),
+            LineVertex::new(1.0, 1.0),
+            LineVertex::new(-1.0, 1.0),
+            LineVertex::new(-1.0, -1.0),
         ];
-        //
-        //        borders.iter_mut().for_each(|x| {
-        //            x.x *= 0.9;
-        //            x.y *= 0.9;
-        //        });
 
-        let quad_vbo = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("quad Buffer"),
-            contents: bytemuck::cast_slice(&[quad_vertices]),
-            usage: wgpu::BufferUsages::VERTEX,
-        });
-        let border_ibo = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("border Buffer"),
-            contents: unsafe {
-                std::slice::from_raw_parts(
-                    borders.as_ptr() as *const u8,
-                    borders.len() * std::mem::size_of::<Vector2<f32>>(),
-                )
-            },
-            usage: wgpu::BufferUsages::VERTEX | BufferUsages::COPY_DST,
-        });
+        let n_x_ticks = 201;
+        let x_step = (size.width - margin * 2) as f32 * pixel_scale.x / (n_x_ticks - 1) as f32;
+        let mut x_tick_x_pos = -1. + margin as f32 * pixel_scale.x;
+        let x_tick_y_pos = -1. + margin as f32 * pixel_scale.y;
+        let x_tick_y_size = 10. * pixel_scale.y;
+        for i in 0..n_x_ticks {
+            // TODO: draw indexed
+            // we are duplicating some vertices here, but it is better to keep the same shader
+            // for few hundred vertices
+            ui_lines.push(LineVertex::new(x_tick_x_pos, x_tick_y_pos));
 
-        let uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Uniform Buffer"),
-            contents: unsafe {
-                std::slice::from_raw_parts(uniforms.as_ptr() as *const u8, uniforms.len() * 256)
-            },
-            usage: wgpu::BufferUsages::UNIFORM
-                | wgpu::BufferUsages::COPY_DST
-                | BufferUsages::MAP_READ,
-        });
+            let mut end_pos = x_tick_y_pos - x_tick_y_size;
+            if i % 2 == 0 {
+                end_pos -= x_tick_y_size;
+            }
 
-        let uniform_bind_group_layout =
-            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                entries: &[wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: true,
-                        min_binding_size: None,
-                        //                        Some(BufferSize::new(256).unwrap()),
-                    },
-                    count: None,
-                }],
-                label: Some("camera_bind_group_layout"),
-            });
-        let uniform_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            layout: &uniform_bind_group_layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: BindingResource::Buffer(BufferBinding {
-                    buffer: &uniform_buffer,
-                    offset: 0,
-                    size: Some(NonZeroU64::new(std::mem::size_of::<Uniform>() as _).unwrap()),
-                }),
-            }],
-            label: Some("camera_bind_group"),
-        });
+            ui_lines.push(LineVertex::new(x_tick_x_pos, end_pos));
+            x_tick_x_pos += x_step;
+        }
+        let n_y_ticks = 201;
+        let y_step = (size.height - margin * 2) as f32 * pixel_scale.y / (n_y_ticks - 1) as f32;
+        let mut y_tick_y_pos = -1. + margin as f32 * pixel_scale.y;
+        let y_tick_x_pos = -1. + margin as f32 * pixel_scale.x;
+        let y_tick_x_size = 10. * pixel_scale.x;
+        for i in 0..n_y_ticks {
+            let mut end_pos = y_tick_x_pos - y_tick_x_size;
+            if i % 2 == 0 {
+                end_pos -= y_tick_x_size;
+            }
+            ui_lines.push(LineVertex::new(end_pos, y_tick_y_pos));
+            // we are duplicating some vertices here, but it is better to keep the same shader
+            // for few hundred vertices
+            ui_lines.push(LineVertex::new(y_tick_x_pos, y_tick_y_pos));
+            y_tick_y_pos += y_step;
+        }
+
+        let ui_vbo = Buffer::new(
+            &device,
+            BufferUsages::VERTEX | BufferUsages::COPY_DST,
+            &ui_lines,
+        );
+        let line_ubo = Buffer::new(
+            &device,
+            BufferUsages::UNIFORM | BufferUsages::COPY_DST,
+            &uniforms,
+        );
         let max = 7.;
         let n_points = 64;
         let points: Vec<_> = (0..n_points)
@@ -579,58 +776,17 @@ impl State {
                 let sinx = x as f32 / n_points as f32 * max;
                 let y = (sinx).sin();
                 let x = (x as f32 / n_points as f32 - 0.5) * 2.;
-                [x, y]
+                LineVertex::new(x, y)
             })
             .collect();
-        let instance_vbo = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("quad Buffer"),
-            contents: bytemuck::cast_slice(&points),
-            usage: wgpu::BufferUsages::VERTEX,
-        });
+        let line_vbo = Buffer::new(&device, BufferUsages::VERTEX, &points);
+        let format = surface.get_preferred_format(&adapter).unwrap();
 
-        //        let mut path_builder = Path::builder();
-        //        path_builder.begin(point(0.0, 0.0));
-        //        path_builder.line_to(point(1.0, 2.0));
-        //        path_builder.line_to(point(2.0, 0.0));
-        //        path_builder.line_to(point(1.0, 1.0));
-        //        path_builder.end(true);
-        //        let path = path_builder.build();
-        //
-        //        // Create the destination vertex and index buffers.
-        //        let mut geometry: VertexBuffers<Vertex, u16> = VertexBuffers::new();
-        //        let mut stroke_tess = StrokeTessellator::new();
-        //        let mut fill_tess = FillTessellator::new();
-        //        let options = StrokeOptions::default().with_line_width(0.01);
-        //        stroke_tess
-        //            .tessellate_path(
-        //                &path,
-        //                &options,
-        //                &mut BuffersBuilder::new(&mut geometry, Ctor),
-        //            )
-        //            .unwrap();
-        //        fill_tess
-        //            .tessellate_path(
-        //                &path,
-        //                &FillOptions::tolerance(tolerance).with_fill_rule(tessellation::FillRule::NonZero),
-        //                &mut BuffersBuilder::new(&mut geometry, Ctor),
-        //            )
-        //            .unwrap();
-
-        //        let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        //            label: Some("Vertex Buffer"),
-        //            contents: bytemuck::cast_slice(&geometry.vertices),
-        //            usage: wgpu::BufferUsages::VERTEX,
-        //        });
-        //        let index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        //            label: Some("Vertex Buffer"),
-        //            contents: bytemuck::cast_slice(&geometry.indices),
-        //            usage: wgpu::BufferUsages::INDEX,
-        //        });
         let config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             //            format: TextureFormat::Rgba8UnormSrgb,
             //            format: TextureFormat::Bgra8UnormSrgb,
-            format: surface.get_preferred_format(&adapter).unwrap(),
+            format,
             //            [Rgba8UnormSrgb, Bgra8UnormSrgb]
             width: size.width,
             height: size.height,
@@ -646,52 +802,44 @@ impl State {
         });
         println!("{} ms", now.elapsed().as_millis());
 
-        let render_pipeline_layout =
-            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: Some("Render Pipeline Layout"),
-                bind_group_layouts: &[&uniform_bind_group_layout],
-                push_constant_ranges: &[],
-            });
-        let render_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("Render Pipeline"),
-            layout: Some(&render_pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: "main",
-                buffers: &[XYVertex::desc(), XYInstance::desc(), XYInstance::desc_inv()],
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &shader,
-                entry_point: "main",
-                targets: &[wgpu::ColorTargetState {
-                    format: config.format,
-                    blend: Some(wgpu::BlendState::REPLACE),
-                    write_mask: wgpu::ColorWrites::ALL,
-                }],
-            }),
-            primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::TriangleList,
-                strip_index_format: None,
-                front_face: wgpu::FrontFace::Cw,
-                cull_mode: None,
-                // Setting this to anything other than Fill requires Features::NON_FILL_POLYGON_MODE
-                polygon_mode: wgpu::PolygonMode::Fill,
-                // Requires Features::DEPTH_CLAMPING
-                clamp_depth: false,
-                // Requires Features::CONSERVATIVE_RASTERIZATION
-                conservative: false,
-            },
-            depth_stencil: None, // 1.
-            multisample: wgpu::MultisampleState {
-                count: 1,                         // 2.
-                mask: !0,                         // 3.
-                alpha_to_coverage_enabled: false, // 4.
-            },
-        });
         println!("{:?}", points);
+        let line_strip_pipeline =
+            LineStripPipeline::new(&device, &config, &LineShader::new(&device));
+        let line_pipeline = LinePipeline::new(&device, &config, &LineShader::new(&device));
         //        println!("{:?}", geometry.indices);
 
-        Self {
+        // Prepare glyph_brush
+        let inconsolata =
+            ab_glyph::FontArc::try_from_slice(include_bytes!("Inconsolata-Regular.ttf"))?;
+
+        let mut glyph_brush = GlyphBrushBuilder::using_font(inconsolata).build(&device, format);
+        let pool = futures::executor::LocalPool::new();
+        let mut x_sections: Vec<_> = (0..n_x_ticks)
+            .into_iter()
+            .map(|x| OwnedSection {
+                screen_position: (0.0, 0.0),
+                bounds: (100.0, 100.0),
+                layout: Layout::default_single_line().h_align(HorizontalAlign::Center),
+                text: vec![OwnedText::new("".to_string())
+                    .with_scale(PxScale { x: 15.0, y: 15.0 })
+                    .with_color(colors::DARK_GRAY)],
+            })
+            .collect();
+        let y_sections = (0..n_y_ticks)
+            .into_iter()
+            .map(|x| OwnedSection {
+                screen_position: (0.0, 0.0),
+                bounds: (0.0, 0.0),
+                layout: Layout::default_single_line().v_align(VerticalAlign::Center),
+                text: vec![OwnedText::new("".to_string())
+                    .with_scale(PxScale { x: 15.0, y: 15.0 })
+                    .with_color(colors::DARK_GRAY)],
+            })
+            .collect();
+
+        Ok(Self {
+            glyph_brush,
+            line_group: LineBindGroup::new(&device, &line_ubo.slice(..)),
             instance_shader: InstanceShader::new(&device, &config, HasDynamicOffset::False),
             instance,
             adapter,
@@ -700,20 +848,25 @@ impl State {
             queue,
             config,
             size,
-            render_pipeline,
-            quad_vbo,
-            //            index_buffer,
-            instance_vbo,
-            border_ibo,
-            instances: points,
-            //            vertices: geometry.vertices,
-            //            indicies: geometry.indices,
-            borders,
-            uniforms: uniforms,
-            ubo: uniform_buffer,
-            uniform_bind_group,
+            line_strip_pipeline,
+            line_vbo,
+            ui_lines,
+            uniforms,
+            ui_vbo,
+            line_ubo,
             margin,
-        }
+            n_x_ticks,
+            line_pipeline,
+            n_y_ticks,
+            x_sections,
+            points,
+            staging_belt: wgpu::util::StagingBelt::new(1024),
+            spawner: pool.spawner(),
+            border_width: 5,
+            pool,
+            y_sections,
+            grid_line_width: 2,
+        })
     }
 }
 
