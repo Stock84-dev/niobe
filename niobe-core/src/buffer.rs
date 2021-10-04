@@ -127,6 +127,10 @@ impl<'a, T: Copy + Pod> BufferSlice<'a, T> {
     pub fn to_raw_slice(&self) -> wgpu::BufferSlice<'a> {
         self.buf.slice(self.raw_addres_range())
     }
+
+    pub fn len(&self) -> u32 {
+        self.range.end - self.range.start
+    }
 }
 
 fn range_from_range_bounds<T: One + CheckedAdd + Zero + Copy>(

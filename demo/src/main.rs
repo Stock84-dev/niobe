@@ -5,6 +5,7 @@ use anyhow::Result;
 use cgmath::{ortho, vec2, InnerSpace, Matrix4, Ortho, Rotation3, Vector2, Zero};
 use futures::executor::{LocalPool, LocalSpawner};
 use futures::task::SpawnExt;
+use futures::StreamExt;
 use glyph_brush::ab_glyph::PxScale;
 use glyph_brush::{HorizontalAlign, Layout, OwnedSection, OwnedText, VerticalAlign};
 use lexical::write_float_options::RoundMode;
@@ -21,10 +22,12 @@ use lyon::tessellation::{
 };
 use nalgebra_glm::Vec2;
 use niobe_core::buffer::Buffer;
-use niobe_core::colors;
 use niobe_core::pipelines::line::{
-    LineBindGroup, LinePipeline, LineShader, LineStripPipeline, LineUniform, LineVertex,
+    LineBindGroup, LinePipeline, LineShader, LineStripPipeline, LineUniform,
 };
+use niobe_core::pipelines::mesh::{MeshBindGroup, MeshPipeline, MeshShader, MeshUniform};
+use niobe_core::Point2dExt;
+use niobe_core::{colors, Mesh2d, Point2d};
 use palette::rgb::Rgba;
 use pipe_trait::*;
 use rgb::RGBA;
@@ -40,7 +43,7 @@ use wgpu::{
     TextureFormat,
 };
 use wgpu_glyph::ab_glyph::FontArc;
-use wgpu_glyph::{ab_glyph, GlyphBrush, GlyphBrushBuilder, Section, Text};
+use wgpu_glyph::{ab_glyph, GlyphBrush, GlyphBrushBuilder, GlyphCruncher, Section, Text};
 use winit::dpi::PhysicalPosition;
 use winit::window::Window;
 use winit::{
@@ -80,6 +83,10 @@ const BACKGROUND_COLOR: RGBA<f32> = RGBA {
     b: 0.01,
     a: 1.,
 };
+
+const N_BORDER_VERTICES: usize = 5;
+const N_CROSSHAIR_VERTICES: usize = 4;
+const N_UI_VERTICES: usize = N_BORDER_VERTICES + N_CROSSHAIR_VERTICES;
 
 #[repr(C)]
 #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
@@ -219,6 +226,7 @@ fn main() -> Result<()> {
                             let pos = Vec2::new(position.x as f32, position.y as f32);
                             let delta = pos - mouse_pos;
                             mouse_pos = pos;
+                            state.mouse_moved(mouse_pos);
                             if left_hold {
                                 state.pan(delta);
                             }
@@ -268,14 +276,6 @@ fn main() -> Result<()> {
     });
 }
 
-#[rustfmt::skip]
-pub const OPENGL_TO_WGPU_MATRIX: cgmath::Matrix4<f32> = cgmath::Matrix4::new(
-    1.0, 0.0, 0.0, 0.0,
-    0.0, 1.0, 0.0, 0.0,
-    0.0, 0.0, 0.5, 0.0,
-    0.0, 0.0, 0.5, 1.0,
-);
-
 #[derive(Copy, Clone, Debug)]
 #[repr(C, align(256))]
 struct Uniform {
@@ -297,24 +297,37 @@ struct State {
     line_group: LineBindGroup,
     line_pipeline: LinePipeline,
     line_strip_pipeline: LineStripPipeline,
-    line_vbo: Buffer<LineVertex>,
-    ui_lines: Vec<LineVertex>,
+    mesh_pipeline: MeshPipeline,
+    line_vbo: Buffer<Point2d>,
+    ui_lines: Vec<Point2d>,
     uniforms: Vec<LineUniform>,
-    ui_vbo: Buffer<LineVertex>,
+    ui_vbo: Buffer<Point2d>,
     line_ubo: Buffer<LineUniform>,
     instance_shader: InstanceShader,
-    points: Vec<LineVertex>,
+    points: Vec<Point2d>,
     margin: u32,
     n_x_ticks: usize,
     n_y_ticks: usize,
     x_sections: Vec<OwnedSection>,
     y_sections: Vec<OwnedSection>,
+    crosshair_sections: Vec<OwnedSection>,
     glyph_brush: GlyphBrush<()>,
     staging_belt: StagingBelt,
     pool: LocalPool,
     spawner: LocalSpawner,
     border_width: u32,
     grid_line_width: u32,
+    crosshair_scale_hover_vbo: Buffer<Point2d>,
+    crosshair_scale_hover_ibo: Buffer<u16>,
+    mesh_ubo: Buffer<MeshUniform>,
+    mesh_uniforms: Vec<MeshUniform>,
+    mesh_group: MeshBindGroup,
+    mesh_instance_vbo: Buffer<Point2d>,
+    mesh_instance_positions: Vec<Point2d>,
+    x_hover_width: u32,
+    y_hover_height: u32,
+    crosshair_scale_hover_vertices: Vec<Point2d>,
+    mouse_pos: Vec2,
 }
 
 impl State {
@@ -358,14 +371,14 @@ impl State {
             self.x_sections[i].screen_position = ((x + 1.) / pixel_scale.x, 1.95 / pixel_scale.y);
             self.x_sections[i].text[0].text =
                 lexical::to_string_with_options::<_, FORMAT>(x_value, &options);
-            self.ui_lines[5 + i * 2] = LineVertex::new(x, -1.);
-            self.ui_lines[5 + i * 2 + 1] = LineVertex::new(x, 1.);
+            self.ui_lines[N_UI_VERTICES + i * 2] = Point2d::new(x, -1.);
+            self.ui_lines[N_UI_VERTICES + i * 2 + 1] = Point2d::new(x, 1.);
             x += tick_spacing;
             if x > 1. - self.margin as f32 * pixel_scale.x {
                 for (j, section) in self.x_sections.iter_mut().enumerate().skip(i + 1) {
                     section.text[0].text = "".into();
-                    self.ui_lines[5 + j * 2] = LineVertex::new(0., 0.);
-                    self.ui_lines[5 + j * 2 + 1] = LineVertex::new(0., 0.);
+                    self.ui_lines[N_UI_VERTICES + j * 2] = Point2d::new(0., 0.);
+                    self.ui_lines[N_UI_VERTICES + j * 2 + 1] = Point2d::new(0., 0.);
                 }
                 break;
             }
@@ -396,21 +409,83 @@ impl State {
                 (0., self.size.height as f32 - (y + 1.) / pixel_scale.y);
             self.y_sections[i].text[0].text =
                 lexical::to_string_with_options::<_, FORMAT>(y_value, &options);
-            self.ui_lines[5 + self.n_x_ticks * 2 + i * 2] = LineVertex::new(-1., y);
-            self.ui_lines[5 + self.n_x_ticks * 2 + i * 2 + 1] = LineVertex::new(1., y);
+            self.ui_lines[N_UI_VERTICES + self.n_x_ticks * 2 + i * 2] = Point2d::new(-1., y);
+            self.ui_lines[N_UI_VERTICES + self.n_x_ticks * 2 + i * 2 + 1] = Point2d::new(1., y);
             y += tick_spacing;
             if y > 1. - self.margin as f32 * pixel_scale.y {
                 for (j, section) in self.y_sections.iter_mut().enumerate().skip(i + 1) {
                     section.text[0].text = "".into();
-                    self.ui_lines[5 + self.n_x_ticks * 2 + j * 2] = LineVertex::new(0., 0.);
-                    self.ui_lines[5 + self.n_x_ticks * 2 + j * 2 + 1] = LineVertex::new(0., 0.);
+                    self.ui_lines[N_UI_VERTICES + self.n_x_ticks * 2 + j * 2] =
+                        Point2d::new(0., 0.);
+                    self.ui_lines[N_UI_VERTICES + self.n_x_ticks * 2 + j * 2 + 1] =
+                        Point2d::new(0., 0.);
                 }
                 break;
             }
             y_value += log;
         }
 
-        self.ui_vbo.write_sliced(&self.queue, 5.., &self.ui_lines);
+        self.ui_vbo
+            .write_sliced(&self.queue, N_UI_VERTICES.., &self.ui_lines);
+    }
+
+    fn mouse_moved(&mut self, mut pos: Vec2) {
+        let pixel_scale = Vec2::new(
+            1. / self.size.width as f32 * 2.,
+            1. / self.size.height as f32 * 2.,
+        );
+        pos.x = pos.x * 2. / self.size.width as f32 - 1.;
+        pos.y = (self.size.height as f32 - pos.y) * 2. / self.size.height as f32 - 1.;
+        self.mouse_pos = pos;
+        // horizontal line
+        self.ui_lines[N_BORDER_VERTICES].x = -1.;
+        self.ui_lines[N_BORDER_VERTICES].y = pos.y;
+        self.ui_lines[N_BORDER_VERTICES + 1].x = 1.;
+        self.ui_lines[N_BORDER_VERTICES + 1].y = pos.y;
+        // vertical line
+        self.ui_lines[N_BORDER_VERTICES + 2].x = pos.x;
+        self.ui_lines[N_BORDER_VERTICES + 2].y = -1.;
+        self.ui_lines[N_BORDER_VERTICES + 3].x = pos.x;
+        self.ui_lines[N_BORDER_VERTICES + 3].y = 1.;
+        self.mesh_uniforms[0].translate = pos;
+        self.mesh_instance_positions[0].x = pos.x;
+        self.mesh_instance_positions[1].y = pos.y;
+        self.ui_vbo
+            .write_sliced(&self.queue, N_BORDER_VERTICES.., &self.ui_lines);
+        self.mesh_instance_vbo
+            .write_sliced(&self.queue, .., &self.mesh_instance_positions);
+        self.update_crosshair_scale_values();
+    }
+
+    fn update_crosshair_scale_values(&mut self) {
+        let pixel_scale = Vec2::new(
+            1. / self.size.width as f32 * 2.,
+            1. / self.size.height as f32 * 2.,
+        );
+        let uni = &self.uniforms[LINES_ID];
+        const FORMAT: u128 = lexical::format::STANDARD;
+        let options = lexical::WriteFloatOptions::builder()
+            // Only write up to 5 significant digits, IE, `1.23456` becomes `1.2345`.
+            .max_significant_digits(NonZeroUsize::new(2))
+            .round_mode(RoundMode::Round)
+            // Trim the trailing `.0` from integral float strings.
+            .trim_floats(true)
+            .decimal_point(b'.')
+            .build()
+            .unwrap();
+        let value = (self.mouse_pos - uni.translate).component_div(&uni.scale);
+        self.crosshair_sections[0].screen_position = (
+            (self.mouse_pos.x + 1.) / pixel_scale.x,
+            1.95 / pixel_scale.y,
+        );
+        self.crosshair_sections[0].text[0].text =
+            lexical::to_string_with_options::<_, FORMAT>(value.x, &options);
+        self.crosshair_sections[1].screen_position = (
+            0.,
+            self.size.height as f32 - (self.mouse_pos.y + 1.) / pixel_scale.y,
+        );
+        self.crosshair_sections[1].text[0].text =
+            lexical::to_string_with_options::<_, FORMAT>(value.y, &options);
     }
 
     fn zoom(&mut self, mut delta: f32) {
@@ -429,6 +504,7 @@ impl State {
         self.update_ticks();
         self.line_ubo
             .write_sliced(&self.queue, LINES_ID.., &self.uniforms);
+        self.update_crosshair_scale_values();
     }
 
     fn pan(&mut self, mut physical_delta: Vec2) {
@@ -462,21 +538,7 @@ impl State {
                 (self.size.width - self.margin * 2) as f32 / self.size.width as f32,
                 (self.size.height - self.margin * 2) as f32 / self.size.height as f32,
             );
-
-            //            self.borders.iter_mut().for_each(|x| {
-            //                x.x = x.x * scale.x;
-            //                x.y = x.y * scale.y;
-            //            });
-            //            self.queue.write_buffer(&self.border_ibo, 0 as _, unsafe {
-            //                std::slice::from_raw_parts(
-            //                    self.borders.as_ptr() as *const u8,
-            //                    self.borders.len() * std::mem::size_of::<Vector2<f32>>(),
-            //                )
-            //            });
             self.uniforms[BORDER_ID].scale = scale;
-            //            self.uniforms[0].line_width = 0.01;
-            //            self.uniforms[0].line_width = (pixel_width as f32 / self.size.width as f32);
-            // we are scaling line width in shader so we are nautralizing here
             self.uniforms[BORDER_ID].line_scale.x = self.border_width as f32 * pixel_scale.x;
             self.uniforms[BORDER_ID].line_scale.y = self.border_width as f32 * pixel_scale.y;
             self.uniforms[GRID_ID].line_scale.x = self.grid_line_width as f32 * pixel_scale.x;
@@ -487,50 +549,38 @@ impl State {
                 "scale {:?} width {:?}",
                 self.uniforms[BORDER_ID].scale, self.uniforms[BORDER_ID].line_scale
             );
-            let x_step = (self.size.width - self.margin * 2) as f32 * pixel_scale.x
-                / (self.n_x_ticks - 1) as f32;
-            let mut x_tick_x_pos = -1. + self.margin as f32 * pixel_scale.x;
-            let x_tick_y_pos = -1. + self.margin as f32 * pixel_scale.y;
-            let x_tick_y_size = 10. * pixel_scale.y;
-            for i in 0..self.n_x_ticks {
-                // TODO: draw indexed
-                // we are duplicating some vertices here, but it is better to keep the same shader
-                // for few hundred vertices
-                self.ui_lines[5 + i * 2] = LineVertex::new(x_tick_x_pos, x_tick_y_pos);
-
-                let mut end_pos = x_tick_y_pos - x_tick_y_size;
-                if i % 2 == 0 {
-                    end_pos -= x_tick_y_size;
-                }
-
-                self.ui_lines[5 + i * 2 + 1] = LineVertex::new(x_tick_x_pos, end_pos);
-                x_tick_x_pos += x_step;
-            }
-
-            let y_step = (self.size.height - self.margin * 2) as f32 * pixel_scale.y
-                / (self.n_y_ticks - 1) as f32;
-            let mut y_tick_y_pos = -1. + self.margin as f32 * pixel_scale.y;
-            let y_tick_x_pos = -1. + self.margin as f32 * pixel_scale.x;
-            let y_tick_x_size = 10. * pixel_scale.x;
-            for i in 0..self.n_y_ticks {
-                let mut end_pos = y_tick_x_pos - y_tick_x_size;
-                if i % 2 == 0 {
-                    end_pos -= y_tick_x_size;
-                }
-                self.ui_lines[self.n_x_ticks * 2 + 5 + i * 2] =
-                    LineVertex::new(end_pos, y_tick_y_pos);
-                // we are duplicating some vertices here, but it is better to keep the same shader
-                // for few hundred vertices
-                self.ui_lines[self.n_x_ticks * 2 + 5 + i * 2 + 1] =
-                    LineVertex::new(y_tick_x_pos, y_tick_y_pos);
-                y_tick_y_pos += y_step;
-            }
-            self.ui_vbo.write_sliced(&self.queue, 5.., &self.ui_lines);
         }
     }
 
     fn input(&mut self, event: &WindowEvent) -> bool {
         false
+    }
+
+    fn update_bg_hover(&mut self) {
+        let pixel_scale = Vec2::new(
+            1. / self.size.width as f32 * 2.,
+            1. / self.size.height as f32 * 2.,
+        );
+        let x_hover_width = self.x_hover_width as f32 * pixel_scale.x / 2.;
+        let y_hover_height = self.y_hover_height as f32 * pixel_scale.y / 2.;
+        self.crosshair_scale_hover_vertices[0].x = -x_hover_width;
+        self.crosshair_scale_hover_vertices[1].x = x_hover_width;
+        self.crosshair_scale_hover_vertices[2].x = x_hover_width;
+        self.crosshair_scale_hover_vertices[2].y = -1. + self.margin as f32 * pixel_scale.y;
+        self.crosshair_scale_hover_vertices[3].x = -x_hover_width;
+        self.crosshair_scale_hover_vertices[3].y = -1. + self.margin as f32 * pixel_scale.y;
+
+        self.crosshair_scale_hover_vertices[4].y = -y_hover_height;
+        self.crosshair_scale_hover_vertices[5].x = -1. + self.margin as f32 * pixel_scale.x;
+        self.crosshair_scale_hover_vertices[5].y = -y_hover_height;
+        self.crosshair_scale_hover_vertices[6].x = -1. + self.margin as f32 * pixel_scale.x;
+        self.crosshair_scale_hover_vertices[6].y = y_hover_height;
+        self.crosshair_scale_hover_vertices[7].y = y_hover_height;
+        self.crosshair_scale_hover_vbo.write_sliced(
+            &self.queue,
+            ..,
+            &self.crosshair_scale_hover_vertices,
+        );
     }
 
     fn update(&mut self) {}
@@ -540,12 +590,12 @@ impl State {
         let view = output
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
-        let mut encoder = self
+        let mut encoder0 = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("Render Encoder"),
             });
-        let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+        let mut render_pass0 = encoder0.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("Render Pass"),
             color_attachments: &[wgpu::RenderPassColorAttachment {
                 view: &view,
@@ -565,11 +615,10 @@ impl State {
         let tick_size = 5;
         let x_offset = self.margin - tick_size;
         let y_offset = self.margin - tick_size;
-        let drawer = self
-            .line_strip_pipeline
-            .drawer(&mut render_pass)
-            .bind_group(&self.line_group, 0)
-            .draw(self.ui_vbo.slice(..5))
+        self.line_strip_pipeline
+            .drawer(&mut render_pass0)
+            .bind_group(&self.line_group, BORDER_ID as u32)
+            .draw(self.ui_vbo.slice(..N_BORDER_VERTICES as u32))
             .finish()
             .pipe(|mut x| {
                 x.as_mut().set_scissor_rect(
@@ -580,19 +629,23 @@ impl State {
                 );
                 x
             })
-            .bind_group(&self.line_group, 2)
+            .bind_group(&self.line_group, LINES_ID as u32)
             .draw(self.line_vbo.slice(..));
 
-        //        render_pass.set_scissor_rect(
-        //            x_offset,
-        //            y_offset,
-        //            self.size.width - x_offset * 2,
-        //            self.size.height - y_offset * 2,
-        //        );
         self.line_pipeline
-            .drawer(&mut render_pass)
-            .bind_group(&self.line_group, 1)
-            .draw(self.ui_vbo.slice(5..));
+            .drawer(&mut render_pass0)
+            .bind_group(&self.line_group, GRID_ID as u32)
+            .draw(
+                self.ui_vbo
+                    .slice(N_BORDER_VERTICES as u32 + N_CROSSHAIR_VERTICES as u32..),
+            )
+            .finish()
+            // draw crosshair last to be on top
+            // TODO: set crosshair line width in pixels and scale it when window size changes
+            .bind_group(&self.line_group, CROSSHAIR_ID as u32)
+            .draw(self.ui_vbo.slice(
+                N_BORDER_VERTICES as u32..N_BORDER_VERTICES as u32 + N_CROSSHAIR_VERTICES as u32,
+            ));
         for section in &self.x_sections {
             self.glyph_brush.queue(section);
         }
@@ -600,23 +653,69 @@ impl State {
             self.glyph_brush.queue(section);
         }
 
-        drop(render_pass);
+        drop(render_pass0);
         self.glyph_brush
             .draw_queued(
                 &self.device,
                 &mut self.staging_belt,
-                &mut encoder,
+                &mut encoder0,
                 &view,
                 self.size.width,
                 self.size.height,
             )
             .expect("Draw queued");
-        self.staging_belt.finish();
 
-        let e = encoder.finish();
-        let i = std::iter::once(e);
-        // submit will accept anything that implements IntoIter
-        self.queue.submit(i);
+        let mut encoder1 = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("Render Encoder 1"),
+            });
+        let mut render_pass1 = encoder1.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("Render Pass 1"),
+            color_attachments: &[wgpu::RenderPassColorAttachment {
+                view: &view,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Load,
+                    store: true,
+                },
+            }],
+            depth_stencil_attachment: None,
+        });
+        let rect = self
+            .glyph_brush
+            .glyph_bounds(&self.crosshair_sections[0])
+            .unwrap();
+        self.x_hover_width = rect.width() as u32 + 10;
+        self.update_bg_hover();
+        self.mesh_pipeline
+            .drawer(
+                &mut render_pass1,
+                self.crosshair_scale_hover_vbo.slice(..4),
+                self.crosshair_scale_hover_ibo.slice(..),
+                &self.mesh_group,
+                0,
+            )
+            .draw(self.mesh_instance_vbo.slice(..1))
+            .set_vertices(self.crosshair_scale_hover_vbo.slice(4..))
+            .draw(self.mesh_instance_vbo.slice(1..2));
+        for section in &self.crosshair_sections {
+            self.glyph_brush.queue(section);
+        }
+        drop(render_pass1);
+        self.glyph_brush
+            .draw_queued(
+                &self.device,
+                &mut self.staging_belt,
+                &mut encoder1,
+                &view,
+                self.size.width,
+                self.size.height,
+            )
+            .expect("Draw queued");
+        // must finish before submiting
+        self.staging_belt.finish();
+        self.queue.submit([encoder0.finish(), encoder1.finish()]);
         self.spawner
             .spawn(self.staging_belt.recall())
             .expect("Recall staging belt");
@@ -699,6 +798,12 @@ impl State {
                 line_scale: Vec2::new(0.002, 0.002),
             },
             LineUniform {
+                color: colors::RED,
+                scale: Vec2::new(1., 1.),
+                translate: Vec2::new(0.0, 0.0),
+                line_scale: Vec2::new(0.002, 0.002),
+            },
+            LineUniform {
                 color: colors::ORANGE,
                 scale: Vec2::new(1., 1.),
                 translate: Vec2::new(0.0, 0.0),
@@ -715,11 +820,16 @@ impl State {
              [0.,  0.5]
         ];
         let mut ui_lines = vec![
-            LineVertex::new(-1.0f32, -1.0),
-            LineVertex::new(1.0, -1.0),
-            LineVertex::new(1.0, 1.0),
-            LineVertex::new(-1.0, 1.0),
-            LineVertex::new(-1.0, -1.0),
+            Point2d::new(-1.0f32, -1.0),
+            Point2d::new(1.0, -1.0),
+            Point2d::new(1.0, 1.0),
+            Point2d::new(-1.0, 1.0),
+            Point2d::new(-1.0, -1.0),
+            // crosshair
+            Point2d::new(-1.0, -1.0),
+            Point2d::new(-1.0, -1.0),
+            Point2d::new(-1.0, -1.0),
+            Point2d::new(-1.0, -1.0),
         ];
 
         let n_x_ticks = 201;
@@ -731,14 +841,14 @@ impl State {
             // TODO: draw indexed
             // we are duplicating some vertices here, but it is better to keep the same shader
             // for few hundred vertices
-            ui_lines.push(LineVertex::new(x_tick_x_pos, x_tick_y_pos));
+            ui_lines.push(Point2d::new(x_tick_x_pos, x_tick_y_pos));
 
             let mut end_pos = x_tick_y_pos - x_tick_y_size;
             if i % 2 == 0 {
                 end_pos -= x_tick_y_size;
             }
 
-            ui_lines.push(LineVertex::new(x_tick_x_pos, end_pos));
+            ui_lines.push(Point2d::new(x_tick_x_pos, end_pos));
             x_tick_x_pos += x_step;
         }
         let n_y_ticks = 201;
@@ -751,10 +861,10 @@ impl State {
             if i % 2 == 0 {
                 end_pos -= y_tick_x_size;
             }
-            ui_lines.push(LineVertex::new(end_pos, y_tick_y_pos));
+            ui_lines.push(Point2d::new(end_pos, y_tick_y_pos));
             // we are duplicating some vertices here, but it is better to keep the same shader
             // for few hundred vertices
-            ui_lines.push(LineVertex::new(y_tick_x_pos, y_tick_y_pos));
+            ui_lines.push(Point2d::new(y_tick_x_pos, y_tick_y_pos));
             y_tick_y_pos += y_step;
         }
 
@@ -776,7 +886,7 @@ impl State {
                 let sinx = x as f32 / n_points as f32 * max;
                 let y = (sinx).sin();
                 let x = (x as f32 / n_points as f32 - 0.5) * 2.;
-                LineVertex::new(x, y)
+                Point2d::new(x, y)
             })
             .collect();
         let line_vbo = Buffer::new(&device, BufferUsages::VERTEX, &points);
@@ -836,6 +946,68 @@ impl State {
                     .with_color(colors::DARK_GRAY)],
             })
             .collect();
+        let crosshair_sections = vec![
+            OwnedSection {
+                screen_position: (0.0, 0.0),
+                bounds: (100.0, 100.0),
+                layout: Layout::default_single_line().h_align(HorizontalAlign::Center),
+                text: vec![OwnedText::new("".to_string())
+                    .with_scale(PxScale { x: 15.0, y: 15.0 })
+                    .with_color(colors::DARK_GRAY)],
+            },
+            OwnedSection {
+                screen_position: (0.0, 0.0),
+                bounds: (100.0, 100.0),
+                layout: Layout::default_single_line().v_align(VerticalAlign::Center),
+                text: vec![OwnedText::new("".to_string())
+                    .with_scale(PxScale { x: 15.0, y: 15.0 })
+                    .with_color(colors::DARK_GRAY)],
+            },
+        ];
+        let mesh_shader = MeshShader::new(&device);
+        let mesh_pipeline = MeshPipeline::new(&device, &config, &mesh_shader);
+        let x_hover_width_px = 20;
+        let y_hover_height_px = 15 + 10;
+        let x_hover_width = x_hover_width_px as f32 * pixel_scale.x;
+        let y_hover_height = y_hover_height_px as f32 * pixel_scale.y;
+        let crosshair_scale_hover_vertices = vec![
+            // x
+            Point2d::new(0., -1.),
+            Point2d::new(x_hover_width, -1.),
+            Point2d::new(x_hover_width, -1. + margin as f32 * pixel_scale.y),
+            Point2d::new(0., -1. + margin as f32 * pixel_scale.y),
+            // y
+            Point2d::new(-1., 0.),
+            Point2d::new(-1. + margin as f32 * pixel_scale.x, 0.),
+            Point2d::new(-1. + margin as f32 * pixel_scale.x, y_hover_height),
+            Point2d::new(-1., y_hover_height),
+        ];
+        let crosshair_scale_hover_indices = vec![0u16, 1, 2, 2, 3, 0];
+        let crosshair_scale_hover_vbo = Buffer::new(
+            &device,
+            BufferUsages::VERTEX | BufferUsages::COPY_DST,
+            &crosshair_scale_hover_vertices,
+        );
+        let crosshair_scale_hover_ibo =
+            Buffer::new(&device, BufferUsages::INDEX, &crosshair_scale_hover_indices);
+        let mesh_uniforms = vec![MeshUniform {
+            color: colors::BROWN,
+            scale: Vec2::new(1., 1.),
+            translate: Vec2::new(0., 0.),
+            mesh_scale: Vec2::new(1., 1.),
+        }];
+        let mesh_ubo = Buffer::new(
+            &device,
+            BufferUsages::UNIFORM | BufferUsages::COPY_DST,
+            &mesh_uniforms,
+        );
+        let mesh_group = MeshBindGroup::new(&device, mesh_ubo.slice(..));
+        let mesh_instance_positions = vec![Point2d::default(), Point2d::default()];
+        let mesh_instance_vbo = Buffer::new(
+            &device,
+            BufferUsages::VERTEX | BufferUsages::COPY_DST,
+            &mesh_instance_positions,
+        );
 
         Ok(Self {
             glyph_brush,
@@ -849,6 +1021,7 @@ impl State {
             config,
             size,
             line_strip_pipeline,
+            mesh_pipeline,
             line_vbo,
             ui_lines,
             uniforms,
@@ -866,6 +1039,18 @@ impl State {
             pool,
             y_sections,
             grid_line_width: 2,
+            crosshair_scale_hover_vbo,
+            crosshair_scale_hover_ibo,
+            mesh_ubo,
+            mesh_uniforms,
+            mesh_group,
+            mesh_instance_vbo,
+            mesh_instance_positions,
+            crosshair_scale_hover_vertices,
+            x_hover_width: x_hover_width_px,
+            y_hover_height: y_hover_height_px,
+            crosshair_sections,
+            mouse_pos: Default::default(),
         })
     }
 }

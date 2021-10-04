@@ -1,4 +1,5 @@
 use crate::buffer::{Buffer, BufferSlice};
+use crate::Point2d;
 use bytemuck::{Pod, Zeroable};
 use nalgebra_glm::Vec2;
 use private::Sealed;
@@ -12,23 +13,6 @@ use wgpu::{
     BindGroup, BindGroupLayout, BindingResource, BufferAddress, BufferBinding, Device,
     DynamicOffset, RenderPass, RenderPipeline, ShaderLocation, ShaderModule, SurfaceConfiguration,
 };
-
-#[repr(C)]
-#[derive(Copy, Clone, Debug)]
-pub struct LineVertex {
-    pub pos: Vec2,
-}
-
-unsafe impl Pod for LineVertex {}
-unsafe impl Zeroable for LineVertex {}
-
-impl LineVertex {
-    pub fn new(x: f32, y: f32) -> Self {
-        Self {
-            pos: Vec2::new(x, y),
-        }
-    }
-}
 
 #[repr(C, align(256))]
 #[derive(Copy, Clone, Debug)]
@@ -185,7 +169,7 @@ pub struct LineDrawer<'s, 'e, E, P> {
 }
 
 impl<'s, 'e, E: RenderEncoder<'s>, P: LineRenderer> LineDrawer<'s, 'e, E, P> {
-    pub fn draw(self, vertices: BufferSlice<'s, LineVertex>) -> Self {
+    pub fn draw(self, vertices: BufferSlice<'s, Point2d>) -> Self {
         self.encoder.set_vertex_buffer(1, vertices.to_raw_slice());
         self.encoder.set_vertex_buffer(2, vertices.to_raw_slice());
         let range = vertices.range();
@@ -241,7 +225,7 @@ fn create_pipeline(
             entry_point: "main",
             buffers: &[
                 wgpu::VertexBufferLayout {
-                    array_stride: std::mem::size_of::<Vec2>() as wgpu::BufferAddress,
+                    array_stride: std::mem::size_of::<Point2d>() as wgpu::BufferAddress,
                     step_mode: wgpu::VertexStepMode::Vertex,
                     attributes: &[wgpu::VertexAttribute {
                         offset: 0,
@@ -250,7 +234,7 @@ fn create_pipeline(
                     }],
                 },
                 wgpu::VertexBufferLayout {
-                    array_stride: mem::size_of::<LineVertex>() as wgpu::BufferAddress
+                    array_stride: mem::size_of::<Point2d>() as wgpu::BufferAddress
                         * stride_multiplier,
                     step_mode: wgpu::VertexStepMode::Instance,
                     attributes: &[wgpu::VertexAttribute {
@@ -260,11 +244,11 @@ fn create_pipeline(
                     }],
                 },
                 wgpu::VertexBufferLayout {
-                    array_stride: mem::size_of::<LineVertex>() as wgpu::BufferAddress
+                    array_stride: mem::size_of::<Point2d>() as wgpu::BufferAddress
                         * stride_multiplier,
                     step_mode: wgpu::VertexStepMode::Instance,
                     attributes: &[wgpu::VertexAttribute {
-                        offset: std::mem::size_of::<LineVertex>() as wgpu::BufferAddress,
+                        offset: std::mem::size_of::<Point2d>() as wgpu::BufferAddress,
                         shader_location: 2,
                         format: wgpu::VertexFormat::Float32x2,
                     }],
