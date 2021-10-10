@@ -151,21 +151,13 @@ impl MeshPipeline {
     pub fn drawer<'s, 'e, E: RenderEncoder<'s>, IF: IndexFormat>(
         &'s self,
         encoder: &'e mut E,
-        vertices: BufferSlice<'s, Point2d>,
-        indices: BufferSlice<'s, IF>,
-        group: &'s MeshBindGroup,
-        uniform_id: u32,
     ) -> MeshDrawer<'e, E> {
         encoder.set_pipeline(&self.pipeline);
-        let drawer = MeshDrawer {
+        MeshDrawer {
             encoder,
             vertices_len: 0,
             indices_len: 0,
-        };
-        drawer
-            .set_vertices(vertices)
-            .set_indices(indices)
-            .set_bind_group(group, uniform_id)
+        }
     }
 }
 
@@ -178,20 +170,20 @@ pub struct MeshDrawer<'e, E> {
 }
 
 impl<'s, 'e, E: RenderEncoder<'s>> MeshDrawer<'e, E> {
-    pub fn set_vertices(mut self, vertices: BufferSlice<'s, Point2d>) -> Self {
+    pub fn set_vertices(&mut self, vertices: BufferSlice<'s, Point2d>) -> &mut Self {
         self.vertices_len = vertices.len();
         self.encoder.set_vertex_buffer(0, vertices.to_raw_slice());
         self
     }
 
-    pub fn set_indices<IF: IndexFormat>(mut self, indices: BufferSlice<'s, IF>) -> Self {
+    pub fn set_indices<IF: IndexFormat>(&mut self, indices: BufferSlice<'s, IF>) -> &mut Self {
         self.indices_len = indices.len();
         self.encoder
             .set_index_buffer(indices.to_raw_slice(), IF::FORMAT);
         self
     }
 
-    pub fn set_bind_group(self, bind_group: &'s MeshBindGroup, uniform_id: u32) -> Self {
+    pub fn set_bind_group(&mut self, bind_group: &'s MeshBindGroup, uniform_id: u32) -> &mut Self {
         self.encoder.set_bind_group(
             0,
             &bind_group.bind_group,
@@ -200,7 +192,7 @@ impl<'s, 'e, E: RenderEncoder<'s>> MeshDrawer<'e, E> {
         self
     }
 
-    pub fn draw(self, instances: BufferSlice<'s, Point2d>) -> Self {
+    pub fn draw(&mut self, instances: BufferSlice<'s, Point2d>) -> &mut Self {
         self.encoder.set_vertex_buffer(1, instances.to_raw_slice());
         // Since instance vertex buffers are sliced we start from 0
         self.encoder

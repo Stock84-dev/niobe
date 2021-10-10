@@ -15,3 +15,8 @@ nalgebra-glm = { path = "../../../../data/Documents/contributions/nalgebra/nalge
 rgb = { version = "0.8.27", features = ["bytemuck"] }
 num-traits = "0.2.14"
 derive_more = "0.99.16"
+egui_wgpu_backend = "0.12.0"
+epaint = { version = "0.14.0", features = ["default_fonts"] }
+stretch = "0.3.2"
+wgpu_glyph = "0.14.1"
+glyph_brush = "0.7"

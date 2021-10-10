@@ -7,6 +7,7 @@ edition = "2018"
 
 [dependencies]
 niobe-core = {path = "../niobe-core" }
+niobe = {path = "../niobe" }
 image = "0.23"
 winit = "0.25"
 cgmath = "0.18"
@@ -27,3 +28,6 @@ pipe-trait = "0.3.2"
 wgpu_glyph = "0.14.1"
 glyph_brush = "0.7.2"
 lexical = "6.0.0"
+stretch = "0.3.2"
+epaint = { version = "0.14.0", features = ["default_fonts"] }
+egui_wgpu_backend = "0.12.0"
